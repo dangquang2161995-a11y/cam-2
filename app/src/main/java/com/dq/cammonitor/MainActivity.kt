@@ -99,17 +99,6 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     private var ptpH = 0
     private var lastInfo: SonyInfo? = null
 
-    // Giải mã JPEG ở luồng riêng để luồng USB lấy khung kế tiếp song song
-    private val frameLock = Object()
-    private var slot = ByteArray(0)
-    private var slotLen = 0
-    private var slotFull = false
-    private var work = ByteArray(0)
-    @Volatile private var decoding = false
-    private var decodeThread: Thread? = null
-    @Volatile private var fpsReceived = 0
-    @Volatile private var fpsShown = 0
-
     /** Surface đang được dùng bởi: 0 = chưa ai, 1 = UVC, 2 = PC Remote */
     private var surfaceUse = 0
     private var surfaceRecreating = false
@@ -132,7 +121,6 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         override fun run() {
             checkSonyRemote()
             refreshDiag()
-            updateFpsInfo()
             handler.postDelayed(this, 1000)
         }
     }
@@ -1220,89 +1208,21 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         logEvent("Sony PC Remote: bắt đầu kết nối")
         val remote = SonyRemote(usb, dev, this)
         sonyRemote = remote
-        startDecoder()
         remote.start()
     }
 
     private fun stopSonyRemote() {
         val remote = sonyRemote ?: return
         ptpSurface = null
-        stopDecoder()
         remote.stop()
-    }
-
-    private fun startDecoder() {
-        if (decodeThread != null) return
-        decoding = true
-        val t = Thread({ decodeLoop() }, "JpegDecoder")
-        decodeThread = t
-        t.start()
-    }
-
-    private fun stopDecoder() {
-        decoding = false
-        synchronized(frameLock) {
-            slotFull = false
-            frameLock.notifyAll()
-        }
-        decodeThread = null
-    }
-
-    private fun decodeLoop() {
-        while (decoding) {
-            var len = 0
-            synchronized(frameLock) {
-                while (!slotFull && decoding) {
-                    try {
-                        frameLock.wait(500)
-                    } catch (e: InterruptedException) {
-                        // bỏ qua
-                    }
-                }
-                if (slotFull) {
-                    // Đổi chỗ hai bộ đệm: luồng USB ghi tiếp vào cái còn lại
-                    val tmp = work
-                    work = slot
-                    slot = tmp
-                    len = slotLen
-                    slotFull = false
-                }
-            }
-            if (len > 0 && decoding) decodeAndDraw(work, len)
-        }
-    }
-
-    /** Mỗi giây cập nhật dòng thông tin: số khung máy ảnh gửi và số khung hiện được. */
-    private fun updateFpsInfo() {
-        if (!ptpStreaming) return
-        val received = fpsReceived
-        val shown = fpsShown
-        fpsReceived = 0
-        fpsShown = 0
-        infoText.text = videoW.toString() + "×" + videoH.toString() +
-            " · PC Remote · nhận " + received + " / hiện " + shown + " fps"
     }
 
     override fun onRemoteLog(msg: String) {
         runOnUiThread { logEvent(msg) }
     }
 
-    /** Chạy trên luồng của SonyRemote: chép khung hình cho luồng giải mã rồi quay lại lấy khung kế. */
+    /** Chạy trên luồng của SonyRemote: giải mã JPEG rồi vẽ vào surface của OpenGL. */
     override fun onRemoteFrame(data: ByteArray, offset: Int, length: Int) {
-        fpsReceived++
-        synchronized(frameLock) {
-            if (slot.size < length) slot = ByteArray(length + 64 * 1024)
-            System.arraycopy(data, offset, slot, 0, length)
-            slotLen = length
-            // Nếu khung trước chưa kịp giải mã thì bị ghi đè: luôn hiện khung mới nhất
-            slotFull = true
-            frameLock.notifyAll()
-        }
-    }
-
-    /** Chạy trên luồng giải mã: giải mã JPEG rồi vẽ vào surface của OpenGL. */
-    private fun decodeAndDraw(data: ByteArray, length: Int) {
-        val offset = 0
         val s = ptpSurface ?: return
         ptpOptions.inMutable = true
         ptpOptions.inBitmap = ptpBitmap
@@ -1332,7 +1252,6 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             ptpDst.set(0, 0, canvas.width, canvas.height)
             canvas.drawBitmap(frame, null, ptpDst, null)
             s.unlockCanvasAndPost(canvas)
-            fpsShown++
         } catch (e: Exception) {
             // surface vừa bị thay, bỏ khung hình này
         }
@@ -1349,8 +1268,6 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         statusText.visibility = View.GONE
         cameraBar.visibility = View.VISIBLE
         infoText.text = w.toString() + "×" + h.toString() + " · PC Remote"
-        fpsReceived = 0
-        fpsShown = 0
         logEvent("PC Remote: có hình " + w + "x" + h)
     }
 
@@ -1370,7 +1287,6 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             sonyRemote = null
             ptpSurface = null
             ptpStreaming = false
-            stopDecoder()
             lastInfo = null
             overlay.cameraRecording = false
             camInfoText.visibility = View.GONE
